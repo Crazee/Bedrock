@@ -868,14 +868,6 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
             int64_t cancellingJobID = nonVisited.top();
             nonVisited.pop();
 
-            // Cancel children if they are not running
-            if (!db.write("UPDATE jobs "
-                          "SET state='CANCELLED' "
-                          "WHERE parentJobID=" + SQ(cancellingJobID) + " "
-                            "AND (state = 'QUEUED' OR state = 'PAUSED');")) {
-                throw "502 Failed to update job data";
-            }
-
             // Retrieve PAUSED children (potential parents)
             SQResult result;
             if (!db.read("SELECT j.jobID "
@@ -889,6 +881,14 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
             for (const auto& row : result.rows) {
                 // If paused, child may have more children, cancel them as well.
                 nonVisited.push(SToInt64(row[0]));
+            }
+
+            // Cancel children if they are not running
+            if (!db.write("UPDATE jobs "
+                          "SET state='CANCELLED' "
+                          "WHERE parentJobID=" + SQ(cancellingJobID) + " "
+                            "AND (state = 'QUEUED' OR state = 'PAUSED');")) {
+                throw "502 Failed to update job data";
             }
         }
 
