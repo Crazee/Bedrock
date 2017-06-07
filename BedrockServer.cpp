@@ -190,21 +190,10 @@ void BedrockServer::sync(SData& args,
         // If we've just switched to the mastering state, we want to upgrade the DB. We'll set a global flag to let
         // worker threads know that a DB upgrade is in progress, and start the upgrade process, which works basically
         // like a regular distributed commit.
-        // We also want to mark anything in our command queue as 'unpeeked'. It's possible that plugins skipped the
-        // peek for various commands, because they'd intended to escalate them to master. We'll reset the peek count to
-        // 0 for everything currently in our queue, and they'll be peeked by the sync thread, as they've been
-        // effectively "escalated" to master without being sent to another server.
         if (preUpdateState != SQLiteNode::MASTERING && nodeState == SQLiteNode::MASTERING) {
-            auto queueSize = syncNodeQueuedCommands.size();
-            if (queueSize) {
-                SWARN("State changed to MASTERING with " << queueSize << " queued commands, resetting peek count.");
-
-                // Pass `each` a lambda function that resets the peek count.
-                syncNodeQueuedCommands.each([](BedrockCommand& c) { c.peekCount = 0; });
-            }
-
             if (server._upgradeDB(db)) {
                 upgradeInProgress.store(true);
+                server._syncThreadCommitMutex.lock();
                 committingCommand = true;
                 server._writableCommandsInProgress++;
                 syncNode.startCommit(SQLiteNode::QUORUM);
@@ -220,7 +209,8 @@ void BedrockServer::sync(SData& args,
             // It should be impossible to get here if we're not mastering or standing down.
             SASSERT(nodeState == SQLiteNode::MASTERING || nodeState == SQLiteNode::STANDINGDOWN);
 
-            // We're done with the commit, we decrement our counter.
+            // We're done with the commit, we unlock our mutex and decrement our counter.
+            server._syncThreadCommitMutex.unlock();
             committingCommand = false;
             server._writableCommandsInProgress--;
             if (syncNode.commitSucceeded()) {
@@ -229,11 +219,13 @@ void BedrockServer::sync(SData& args,
                     upgradeInProgress.store(false);
                     continue;
                 }
+                SINFO("[performance] Sync thread finished committing command " << command.request.methodLine);
 
                 // Otherwise, mark this command as complete and reply.
                 command.complete = true;
                 if (command.initiatingPeerID) {
                     // This is a command that came from a peer. Have the sync node send the response back to the peer.
+                    command.finalizeTimingInfo();
                     syncNode.sendResponse(command);
                 } else {
                     // The only other option is this came from a client, so respond via the server.
@@ -241,6 +233,9 @@ void BedrockServer::sync(SData& args,
                 }
             } else {
                 // If the commit failed, then it must have conflicted, so we'll re-queue it to try again.
+                SINFO("[performance] Conflict committing in sync thread, requeueing command "
+                      << command.request.methodLine << ". Sync thread has "
+                      << syncNodeQueuedCommands.size() << " queued commands.");
                 syncNodeQueuedCommands.push(move(command));
             }
         }
@@ -256,6 +251,7 @@ void BedrockServer::sync(SData& args,
                     SASSERT(completedCommand.complete);
                     SASSERT(completedCommand.initiatingPeerID);
                     SASSERT(!completedCommand.initiatingClientID);
+                    completedCommand.finalizeTimingInfo();
                     syncNode.sendResponse(completedCommand);
                 }
             } catch (out_of_range e) {
@@ -276,22 +272,24 @@ void BedrockServer::sync(SData& args,
 
             // Now we can pull the next command off the queue and start on it.
             command = syncNodeQueuedCommands.pop();
+            SINFO("[performance] Sync thread dequeued command " << command.request.methodLine << ". Sync thread has "
+                  << syncNodeQueuedCommands.size() << " queued commands.");
 
             // We got a command to work on! Set our log prefix to the request ID.
             SAUTOPREFIX(command.request["requestID"]);
 
-            // If a command hasn't been peeked yet (which should be unusual and only happen for commands that were
-            // already queued as we were promoted to MASTERING), we'll peek it now.
-            if (!command.peekCount) {
-                if (!command.httpsRequest) {
-                    if (core.peekCommand(command)) {
-                        // This command completed in peek, stick it back in the queue for a worker to respond to.
-                        SASSERT(command.complete);
-                        server._commandQueue.push(BedrockCommand(move(command)));
-                        continue;
-                    }
-                } else {
-                    SWARN("Command " << command.request.methodLine << " has peekCount of 0 but httpsRequest.");
+            // We peek commands here in the sync thread to be able to run peek and process as part of the same
+            // transaction. This guarantees that any checks made in peek are still valid in process, as the DB can't
+            // have changed in the meantime.
+            // IMPORTANT: This check is omitted for commands with an HTTPS request object, because we don't want to
+            // risk duplicating that request. If your command creates an HTTPS request, it needs to explicitly
+            // re-verify that any checks made in peek are still valid in process.
+            if (!command.httpsRequest) {
+                if (core.peekCommand(command)) {
+                    // This command completed in peek, stick it back in the queue for a worker to respond to.
+                    SASSERT(command.complete);
+                    server._commandQueue.push(move(command));
+                    continue;
                 }
             }
 
@@ -305,12 +303,13 @@ void BedrockServer::sync(SData& args,
 
             // And now we'll decide how to handle it.
             if (nodeState == SQLiteNode::MASTERING) {
-                // If we're getting it on the sync thread, that means it's already been `peeked` unsuccessfully, and it
-                // needed to be processed. If it were `peeked` successfully, then the worker thread wouldn't have given
-                // it back to us.
+                // Now that we've peeked without finishing the command, we grab the commit mutex exclusively, so that none
+                // of our worker threads can attempt to write to the database until we're finished.
+                server._syncThreadCommitMutex.lock();
                 if (core.processCommand(command)) {
                     // The processor says we need to commit this, so let's start that process.
                     committingCommand = true;
+                    SINFO("[performance] Sync thread beginning committing command " << command.request.methodLine);
                     server._writableCommandsInProgress++;
                     syncNode.startCommit(command.writeConsistency);
 
@@ -325,7 +324,9 @@ void BedrockServer::sync(SData& args,
                 } else {
                     // Otherwise, the command doesn't need a commit (maybe it was an error, or it didn't have any work
                     // to do. We'll just respond.
+                    server._syncThreadCommitMutex.unlock();
                     if (command.initiatingPeerID) {
+                        command.finalizeTimingInfo();
                         syncNode.sendResponse(command);
                     } else {
                         server._reply(command);
@@ -400,6 +401,8 @@ void BedrockServer::worker(SData& args,
             // If we can't find any work to do, this will throw.
             command = server._commandQueue.get(1000000);
             SAUTOPREFIX(command.request["requestID"]);
+            SINFO("[performance] Dequeued command " << command.request.methodLine << " in worker, "
+                  << server._commandQueue.size() << " commands in queue.");
 
             // We just spin until the node looks ready to go. Typically, this doesn't happen expect briefly at startup.
             while (upgradeInProgress.load() ||
@@ -508,6 +511,9 @@ void BedrockServer::worker(SData& args,
                         command.writeConsistency != SQLiteNode::ASYNC)
                     {
                         // We're not handling a writable command anymore.
+                        SINFO("[performance] Sending non-parallel command " << command.request.methodLine
+                              << " to sync thread. Sync thread has " << syncNodeQueuedCommands.size()
+                              << " queued commands.");
                         server._writableCommandsInProgress--;
                         syncNodeQueuedCommands.push(move(command));
 
@@ -515,6 +521,16 @@ void BedrockServer::worker(SData& args,
                         // look for another command to work on.
                         break;
                     } else {
+                        // Before we commit, we need to grab the sync thread lock. Because the sync thread grabs an
+                        // exclusive lock on this wrapping any transactions that it performs, we'll get this lock while
+                        // the sync thread isn't in the process of handling a transaction, thus guaranteeing that we
+                        // can't commit and cause a conflict on the sync thread. We can still get conflicts here, as
+                        // the sync thread might have performed a transaction after we called `processCommand` and
+                        // before we call `commit`, or we could conflict with another worker thread, but the sync
+                        // thread will never see a conflict as long as we don't commit while it's performing a
+                        // transaction.
+                        shared_lock<decltype(server._syncThreadCommitMutex)> lock(server._syncThreadCommitMutex);
+
                         // In this case, there's nothing blocking us from processing this in a worker, so let's try it.
                         if (core.processCommand(command)) {
                             // If processCommand returned true, then we need to do a commit. Otherwise, the command is
@@ -569,7 +585,8 @@ void BedrockServer::worker(SData& args,
 
             // We ran out of retries without finishing! We give it to the sync thread.
             if (!retry) {
-                SINFO("Max retries hit in worker, forwarding command to sync node.");
+                SINFO("[performance] Max retries hit in worker, forwarding command " << command.request.methodLine
+                      << " to sync thread. Sync thread has " << syncNodeQueuedCommands.size() << " queued commands.");
                 syncNodeQueuedCommands.push(move(command));
             }
         } catch(...) {
@@ -938,6 +955,12 @@ void BedrockServer::postPoll(fd_map& fdm, uint64_t& nextActivity) {
                 }
             }
             break;
+            case STCPManager::Socket::SHUTTINGDOWN:
+            {
+                // We do nothing in this state, we just wait until the next iteration of poll and let the CLOSED
+                // case run. This block just prevents default warning from firing.
+            }
+            break;
             default:
             {
                 SWARN("Socket in unhandled state: " << s->state);
@@ -967,6 +990,9 @@ void BedrockServer::_reply(BedrockCommand& command) {
     // Do we have a socket for this command?
     auto socketIt = _socketIDMap.find(command.initiatingClientID);
     if (socketIt != _socketIDMap.end()) {
+
+        // The last thing we do is total up our timing info and add it to the response.
+        command.finalizeTimingInfo();
 
         // Is a plugin handling this command? If so, it gets to send the response.
         string& pluginName = command.request["plugin"];

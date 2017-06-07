@@ -42,6 +42,16 @@ class SQLiteCommand {
     // Whether this command has been completed.
     bool complete;
 
+    // Performance metrics.
+    // This is the amount of time a command spent in escalation. A master node will record this from the time it first
+    // dequeues and parses the command, until the time it sends the response back to a slave. A slave node will record
+    // this from just before it sends the command to master until it gets the response back.
+    uint64_t escalationTimeUS;
+
+    // Timestamp at which this command was created. This is specific to the current server - it's not persisted from
+    // slave to master.
+    uint64_t creationTime;
+
     // Construct that takes a request object.
     SQLiteCommand(SData&& _request);
 
