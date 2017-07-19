@@ -102,8 +102,16 @@ void STCPNode::postPoll(fd_map& fdm, uint64_t& nextActivity) {
 
                     // Did we find it?
                     if (!foundIt) {
+						string		name = message["Name"];
+						string		host = name + string(":8889");
+						STable		params;
+						params.clear();
+
+						addPeer(name, host, params);
+                        SWARN("Unlisted node '" << message["Name"] << "' will add for next time.");
+
                         // This node wasn't expected
-                        SWARN("Unauthenticated node '" << message["Name"] << "' attempted to connected, rejecting.");
+//                        SWARN("Unauthenticated node '" << message["Name"] << "' attempted to connected, rejecting.");
                         throw "unauthenticated node";
                     }
                 } else
