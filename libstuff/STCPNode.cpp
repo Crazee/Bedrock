@@ -102,9 +102,14 @@ void STCPNode::postPoll(fd_map& fdm, uint64_t& nextActivity) {
 
                     // Did we find it?
                     if (!foundIt) {
-						string		name = message["Name"];
-						string		host = name + string(":8889");
-						STable		params;
+						stringstream	ss;
+						ss << socket->addr << ":8889";
+
+						string			host = ss.str();
+						string			name = message["Name"];
+//						string		host = name + string(":8889");
+
+						STable			params;
 						params.clear();
 
 						addPeer(name, host, params);
